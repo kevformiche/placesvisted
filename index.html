@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Routes from Los Angeles</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+<style>
+  :root {
+    --panel-bg: #11161c;
+    --panel-fg: #e7edf3;
+    --accent: #ffb347;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  #app { display: flex; height: 100%; }
+  #map { flex: 1; height: 100%; }
+  #sidebar {
+    width: 320px;
+    background: var(--panel-bg);
+    color: var(--panel-fg);
+    overflow-y: auto;
+    padding: 18px 18px 40px;
+    box-shadow: -2px 0 12px rgba(0,0,0,.35);
+  }
+  #sidebar h1 { font-size: 18px; margin: 0 0 4px; }
+  #sidebar .sub { font-size: 12px; opacity: .65; margin-bottom: 16px; }
+  .origin-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #1d2630; border: 1px solid #2c3946; border-radius: 999px;
+    padding: 5px 12px; font-size: 12px; margin-bottom: 16px;
+  }
+  .origin-chip .dot { width: 10px; height: 10px; border-radius: 50%; background: #4dabf7; }
+  ul.dest-list { list-style: none; padding: 0; margin: 0; }
+  ul.dest-list li {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 8px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent; transition: background .15s, border-color .15s;
+  }
+  ul.dest-list li:hover { background: #1b242e; border-color: #2c3946; }
+  ul.dest-list li .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  ul.dest-list li .name { font-size: 14px; flex: 1; }
+  ul.dest-list li .dist { font-size: 12px; opacity: .7; font-variant-numeric: tabular-nums; }
+  .mode { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; opacity: .5; }
+  .footer { margin-top: 18px; font-size: 11px; opacity: .5; line-height: 1.5; }
+  .leaflet-popup-content { font-size: 13px; }
+  .pin-label { font-weight: 600; }
+
+  /* ---- Mobile: stack the map on top, scrollable list below ---- */
+  @media (max-width: 720px) {
+    #app { flex-direction: column; }
+    #map { height: 55vh; min-height: 240px; width: 100%; flex: none; }
+    #sidebar {
+      width: 100%;
+      max-height: 45vh;
+      padding: 14px 16px 28px;
+      box-shadow: 0 -2px 12px rgba(0,0,0,.35);
+      -webkit-overflow-scrolling: touch;
+    }
+    #sidebar h1 { font-size: 17px; }
+    /* Bigger tap targets for touch */
+    ul.dest-list li { padding: 13px 8px; }
+    .footer { margin-top: 14px; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="map"></div>
+  <aside id="sidebar">
+    <h1>Routes from Los Angeles</h1>
+    <div class="sub">Click a destination to fly to it. Lines show the path from LA.</div>
+    <div class="origin-chip"><span class="dot"></span> Origin: Los Angeles, CA</div>
+    <ul class="dest-list" id="destList"></ul>
+    <div class="footer">
+      Land routes follow real turn-by-turn driving directions (via the OSRM routing service),
+      with driving distance and estimated drive time. Hawaii is shown as a direct flight path
+      across the Pacific. Routes load a moment after the map opens.
+    </div>
+  </aside>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+const ORIGIN = { name: "Los Angeles, CA", lat: 34.0522, lng: -118.2437 };
+
+// Distinct colors per destination
+const DESTS = [
+  { name: "Hawaii (Big Island)",      lat: 19.5429, lng: -155.6659, color: "#ff6b6b", mode: "flight" },
+  { name: "Temecula, CA",             lat: 33.4936, lng: -117.1484, color: "#4dabf7", mode: "drive" },
+  { name: "Santa Barbara, CA",        lat: 34.4208, lng: -119.6982, color: "#69db7c", mode: "drive" },
+  { name: "American Falls, ID",       lat: 42.7866, lng: -112.8553, color: "#ffd43b", mode: "drive" },
+  { name: "Grand Tetons, WY",         lat: 43.7904, lng: -110.6818, color: "#da77f2", mode: "drive" },
+  { name: "Yellowstone, WY",          lat: 44.4280, lng: -110.5885, color: "#f783ac", mode: "drive" },
+  { name: "St. George, UT",           lat: 37.0965, lng: -113.5684, color: "#ffa94d", mode: "drive" },
+  { name: "Las Vegas, NV",            lat: 36.1699, lng: -115.1398, color: "#3bc9db", mode: "drive" },
+];
+
+// Haversine distance in miles
+function miles(a, b) {
+  const R = 3958.8, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
+  const s = Math.sin(dLat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLng/2)**2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(s)));
+}
+
+// Great-circle interpolation so long lines curve naturally on the map
+function greatCircle(a, b, n = 64) {
+  const toRad = d => d*Math.PI/180, toDeg = r => r*180/Math.PI;
+  const lat1 = toRad(a.lat), lon1 = toRad(a.lng), lat2 = toRad(b.lat), lon2 = toRad(b.lng);
+  const d = 2*Math.asin(Math.sqrt(Math.sin((lat2-lat1)/2)**2 +
+            Math.cos(lat1)*Math.cos(lat2)*Math.sin((lon2-lon1)/2)**2));
+  if (d === 0) return [[a.lat, a.lng], [b.lat, b.lng]];
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const f = i/n;
+    const A = Math.sin((1-f)*d)/Math.sin(d), B = Math.sin(f*d)/Math.sin(d);
+    const x = A*Math.cos(lat1)*Math.cos(lon1) + B*Math.cos(lat2)*Math.cos(lon2);
+    const y = A*Math.cos(lat1)*Math.sin(lon1) + B*Math.cos(lat2)*Math.sin(lon2);
+    const z = A*Math.sin(lat1) + B*Math.sin(lat2);
+    pts.push([toDeg(Math.atan2(z, Math.sqrt(x*x+y*y))), toDeg(Math.atan2(y, x))]);
+  }
+  return pts;
+}
+
+const map = L.map("map", { worldCopyJump: true }).setView([34, -125], 4);
+
+L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+  attribution: '&copy; OpenStreetMap &copy; CARTO',
+  maxZoom: 18,
+}).addTo(map);
+
+function dot(color, size = 14) {
+  return L.divIcon({
+    className: "",
+    html: `<div style="width:${size}px;height:${size}px;background:${color};border:2px solid #fff;border-radius:50%;box-shadow:0 0 4px rgba(0,0,0,.5)"></div>`,
+    iconSize: [size, size], iconAnchor: [size/2, size/2],
+  });
+}
+
+// Origin marker
+L.marker([ORIGIN.lat, ORIGIN.lng], { icon: dot("#1c7ed6", 20), zIndexOffset: 1000 })
+  .addTo(map)
+  .bindPopup(`<span class="pin-label">${ORIGIN.name}</span><br>Starting point`);
+
+// Public OSRM demo server: free, no API key. Returns real road geometry + drive time.
+const OSRM = "https://router.project-osrm.org/route/v1/driving/";
+
+async function drivingRoute(a, b) {
+  const url = `${OSRM}${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("routing request failed");
+  const json = await res.json();
+  if (json.code !== "Ok" || !json.routes || !json.routes.length) throw new Error("no route found");
+  const r = json.routes[0];
+  return {
+    coords: r.geometry.coordinates.map(([lng, lat]) => [lat, lng]), // GeoJSON is lng,lat
+    miles: Math.round(r.distance / 1609.34),
+    minutes: Math.round(r.duration / 60),
+  };
+}
+
+function fmtDuration(min) {
+  const h = Math.floor(min / 60), m = min % 60;
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+const layers = {};
+const allPoints = [[ORIGIN.lat, ORIGIN.lng]];
+const list = document.getElementById("destList");
+
+DESTS.forEach((d, i) => {
+  const straight = miles(ORIGIN, d);
+  // Land routes start as a faint great-circle placeholder, then snap to the real road path.
+  const line = L.polyline(greatCircle(ORIGIN, d), {
+    color: d.color,
+    weight: d.mode === "flight" ? 3 : 4,
+    opacity: d.mode === "flight" ? .85 : .35,
+    dashArray: d.mode === "flight" ? "8 8" : null,
+  }).addTo(map);
+
+  const marker = L.marker([d.lat, d.lng], { icon: dot(d.color) })
+    .addTo(map)
+    .bindPopup(`<span class="pin-label">${d.name}</span><br>${straight.toLocaleString()} mi from LA &middot; ${d.mode}`);
+
+  allPoints.push([d.lat, d.lng]);
+
+  const li = document.createElement("li");
+  li.innerHTML = `
+    <span class="swatch" style="background:${d.color}"></span>
+    <span class="name">${d.name}<br><span class="mode">${d.mode === "flight" ? "flight" : "loading route…"}</span></span>
+    <span class="dist">${straight.toLocaleString()} mi</span>`;
+  const distEl = li.querySelector(".dist");
+  const modeEl = li.querySelector(".mode");
+  const restWeight = () => d.mode === "flight" ? 3 : 4;
+  li.addEventListener("click", () => {
+    map.fitBounds(line.getBounds().pad(0.2), { duration: 1.1 });
+    marker.openPopup();
+    line.setStyle({ weight: 7 });
+    setTimeout(() => line.setStyle({ weight: restWeight() }), 1400);
+  });
+  li.addEventListener("mouseenter", () => line.setStyle({ weight: 7 }));
+  li.addEventListener("mouseleave", () => line.setStyle({ weight: restWeight() }));
+  list.appendChild(li);
+
+  layers[i] = { line, marker, dest: d, distEl, modeEl };
+});
+
+map.fitBounds(L.latLngBounds(allPoints).pad(0.15));
+
+// Fetch real driving directions for each land destination (sequentially, to be kind to the demo server).
+(async () => {
+  for (const i of Object.keys(layers)) {
+    const { line, marker, dest, distEl, modeEl } = layers[i];
+    if (dest.mode === "flight") continue;
+    try {
+      const r = await drivingRoute(ORIGIN, dest);
+      line.setLatLngs(r.coords);
+      line.setStyle({ opacity: .9 });
+      distEl.textContent = r.miles.toLocaleString() + " mi";
+      modeEl.textContent = "drive · " + fmtDuration(r.minutes);
+      marker.setPopupContent(
+        `<span class="pin-label">${dest.name}</span><br>${r.miles.toLocaleString()} mi &middot; ${fmtDuration(r.minutes)} drive from LA`
+      );
+    } catch (e) {
+      modeEl.textContent = "drive (approx · straight line)";
+    }
+  }
+})();
+</script>
+</body>
+</html>
